@@ -1,0 +1,24 @@
+services:
+  tiler:
+    build: .
+    image: offline-tile-packer:latest
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+      # Shared PPM staging quota. 20 MiB makes the quota behaviour visible
+      # with modest test tiles; raise it for real workloads.
+      PPM_STAGING_BYTES: "20971520"
+      WORKERS: "2"             # two local converter processes
+      MAX_ACTIVE_BATCHES: "2"  # two batches may pack concurrently
+    volumes:
+      - tiler-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/status')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  tiler-data:
