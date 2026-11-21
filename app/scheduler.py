@@ -30,6 +30,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import Settings
+from .tileindex import (
+    TileIndexError,
+    build_tile_index,
+    index_path_for,
+    write_tile_index_atomic,
+)
 from .worker import run_worker
 
 log = logging.getLogger("tiler")
@@ -58,6 +64,8 @@ class Tile:
     ppm_size: int | None  # exact PPM size predicted from the PNG header
     state: str = PENDING
     reserved: int = 0     # staging quota bytes currently held
+    tar_header_offset: int | None = None  # header position inside the tar, set at pack time
+    packed_size: int | None = None        # actual PPM bytes written into the tar
 
 
 @dataclass
@@ -73,6 +81,7 @@ class Batch:
     error: str | None = None
     tar: tarfile.TarFile | None = None
     pack_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    index_published: bool = False  # True only once tar + verified sidecar index exist
 
     @property
     def held_bytes(self) -> int:
@@ -288,17 +297,42 @@ class Scheduler:
                 )
             if batch.state == PACKING and batch.next_to_pack == len(batch.tiles):
                 await asyncio.to_thread(self._close_tar, batch)
+                # Publish the read-only per-tile index before the batch can
+                # become DONE: tile fetch is legal only once both the closed
+                # tar and the verified index sidecar exist.
+                try:
+                    await asyncio.to_thread(self._publish_index, batch)
+                except TileIndexError as exc:
+                    self._fail_publish(batch, str(exc))
+                    log.error("batch=%s index publish FAILED error=%r", batch.id, exc)
+                    return
+                batch.index_published = True
                 batch.state = DONE
                 self.active.remove(batch)
                 shutil.rmtree(self.stage_dir / batch.id, ignore_errors=True)
-                log.info("batch=%s DONE tar=%s", batch.id, batch.tar_path)
+                log.info(
+                    "batch=%s DONE tar=%s index=%s",
+                    batch.id, batch.tar_path.name,
+                    index_path_for(batch.tar_path).name,
+                )
                 self._activate()
 
     @staticmethod
     def _append_and_clear(batch: Batch, tile: Tile) -> None:
         if batch.tar is None:
             batch.tar_path.parent.mkdir(parents=True, exist_ok=True)
-            batch.tar = tarfile.open(batch.tar_path, "w")
+            # USTAR_FORMAT keeps one header block per entry (no per-entry PAX
+            # extension headers), so the offset captured below points directly
+            # at the tile's own 512-byte header. Entry names are at most
+            # 6-digit prefix + 80-char sanitized name, inside USTAR's 100-char
+            # name field, and only regular PPM files are stored.
+            batch.tar = tarfile.open(
+                batch.tar_path, "w", format=tarfile.USTAR_FORMAT
+            )
+        # Capture the header position before addfile so a single tile can be
+        # read back via one seek + one header block, without scanning the tar.
+        tile.tar_header_offset = batch.tar.offset
+        tile.packed_size = tile.ppm_path.stat().st_size
         batch.tar.add(tile.ppm_path, arcname=tile.arcname)
         tile.ppm_path.unlink()  # staging cleared; quota is released by the caller
 
@@ -307,6 +341,26 @@ class Scheduler:
         if batch.tar is not None:
             batch.tar.close()
             batch.tar = None
+
+    def _publish_index(self, batch: Batch) -> None:
+        """Verify the closed tar and atomically publish its read-only index.
+
+        Runs in a worker thread. Raises TileIndexError if any recorded header
+        does not verify; in that case the batch must fail rather than serve a
+        tar that cannot be indexed.
+        """
+        records = [
+            (
+                t.index,
+                t.name,
+                t.arcname,
+                t.tar_header_offset if t.tar_header_offset is not None else -1,
+                t.packed_size if t.packed_size is not None else -1,
+            )
+            for t in batch.tiles
+        ]
+        index = build_tile_index(batch.tar_path, records)
+        write_tile_index_atomic(batch.tar_path, index)
 
     # ------------------------------------------------------------------
     # failure handling
@@ -341,13 +395,14 @@ class Scheduler:
         self._activate()
 
     async def _cleanup_failed(self, batch: Batch) -> None:
-        """Remove the failed batch's staged PPMs and partial tar."""
+        """Remove the failed batch's staged PPMs, partial tar and any index."""
         try:
             async with batch.pack_lock:
                 if batch.tar is not None:
                     batch.tar.close()
                     batch.tar = None
                 batch.tar_path.unlink(missing_ok=True)
+                index_path_for(batch.tar_path).unlink(missing_ok=True)
                 for t in batch.tiles:
                     try:
                         t.ppm_path.unlink(missing_ok=True)
@@ -356,6 +411,25 @@ class Scheduler:
                 shutil.rmtree(self.stage_dir / batch.id, ignore_errors=True)
         except Exception:  # pragma: no cover - defensive
             log.exception("batch=%s cleanup failed", batch.id)
+
+    def _fail_publish(self, batch: Batch, error: str) -> None:
+        """Mark a batch failed after its tar closed but the index could not be
+        published/verified. A batch without a complete, verified index must
+        never become downloadable or serve individual tiles."""
+        batch.state = FAILED
+        batch.failed_tile = batch.tiles[-1].name if batch.tiles else None
+        batch.error = f"index publication failed: {error}"
+        batch.index_published = False
+        if batch in self.active:
+            self.active.remove(batch)
+        else:  # pragma: no cover - defensive
+            try:
+                self.waiting.remove(batch)
+            except ValueError:
+                pass
+        log.error("batch=%s FAILED at index publication error=%r", batch.id, error)
+        asyncio.get_running_loop().create_task(self._cleanup_failed(batch))
+        self._activate()
 
     # ------------------------------------------------------------------
     # introspection for the API
@@ -378,6 +452,7 @@ class Scheduler:
             "tiles_started": batch.next_to_start,
             "tiles_packed": batch.next_to_pack,
             "staging_bytes_held": batch.held_bytes,
+            "index_published": batch.index_published,
             "failed_tile": batch.failed_tile,
             "error": batch.error,
             "download_url": f"/batches/{batch.id}/download" if batch.state == DONE else None,
@@ -388,6 +463,11 @@ class Scheduler:
                     "state": t.state,
                     "ppm_size": t.ppm_size,
                     "arcname": t.arcname,
+                    "tile_url": (
+                        f"/batches/{batch.id}/tiles/{t.index}"
+                        if batch.state == DONE and batch.index_published
+                        else None
+                    ),
                 }
                 for t in batch.tiles
             ],
